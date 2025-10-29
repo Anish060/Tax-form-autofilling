@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const router = express.Router();
 const { Document, TaxReturn, User } = require('../models');
@@ -10,32 +12,59 @@ router.get('/document/:id', async (req, res) => {
 });
 
 router.post('/generate', async (req, res) => {
-  // body: { documentId, assessmentYear, regime, userId }
   const { documentId, assessmentYear, regime, userId } = req.body;
   try {
     const doc = await Document.findByPk(documentId);
     if (!doc) return res.status(404).json({ error: 'doc not found' });
 
-    // naive tax computation (demo): use extracted fields
-    const ext = doc.extractedJson || {};
+    // ✅ Parse extracted JSON safely
+    let ext = doc.extractedJson || {};
+    if (typeof ext === "string") {
+      try {
+        ext = JSON.parse(ext);
+      } catch (e) {
+        console.warn("Failed to parse extractedJson:", e);
+        ext = {};
+      }
+    }
+
+    // Naive tax computation
     const salary = ext.salary_income || 0;
     const other = ext.other_income || 0;
     const deductions = ext.deductions || {};
     const totalDeductions = Object.values(deductions).reduce((a,b)=>a+(Number(b)||0),0);
-    const gross = Number(salary || 0) + Number(other || 0);
+    const gross = Number(salary) + Number(other);
     const taxable = Math.max(0, gross - totalDeductions);
 
-    // simplistic slab computation (example only) - you would implement full Indian slab logic
-    const computeTax = (income) => {
-      // replace with actual slab logic for the assessment year & regime
-      let tax = 0;
-      if (income <= 250000) tax = 0;
-      else if (income <= 500000) tax = (income - 250000) * 0.05;
-      else if (income <= 1000000) tax = 2500 + (income - 500000) * 0.2;
-      else tax = 1e4 + (income - 1000000) * 0.3;
-      const cess = tax * 0.04;
-      return Math.round(tax + cess);
-    };
+    // Actual Indian Income Tax computation (Old Regime - FY 2024-25)
+const computeTax = (income) => {
+  let tax = 0;
+
+  if (income <= 250000) {
+    tax = 0; // No tax for income up to ₹2.5L
+  } 
+  else if (income <= 500000) {
+    tax = (income - 250000) * 0.05; // 5% for 2.5L–5L
+  } 
+  else if (income <= 1000000) {
+    tax = (250000 * 0.05) + (income - 500000) * 0.2; // 5% on next 2.5L, 20% on rest
+  } 
+  else {
+    tax = (250000 * 0.05) + (500000 * 0.2) + (income - 1000000) * 0.3; // 5% + 20% + 30%
+  }
+
+  // ✅ Rebate under Section 87A (for income up to ₹5L)
+  if (income <= 500000) {
+    tax = 0;
+  }
+
+  // ✅ Add Health & Education Cess (4%)
+  const cess = tax * 0.04;
+
+  // ✅ Total tax rounded to nearest integer
+  return Math.round(tax + cess);
+};
+
 
     const computedTax = {
       gross,
@@ -44,7 +73,7 @@ router.post('/generate', async (req, res) => {
       taxPayable: computeTax(taxable)
     };
 
-    // generate PDF
+    // ✅ Generate PDF using parsed data
     const pdfPath = await pdfGen.generateITRPdf({
       taxpayerName: ext.taxpayer_name || 'Unknown',
       pan: ext.pan || null,
@@ -53,7 +82,7 @@ router.post('/generate', async (req, res) => {
       extracted: ext
     });
 
-    // store tax return
+    // ✅ Save TaxReturn entry
     const taxReturn = await TaxReturn.create({
       assessmentYear,
       regime,
@@ -70,5 +99,25 @@ router.post('/generate', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+router.get('/download/:id', async (req, res) => {
+  try {
+    const taxReturn = await TaxReturn.findByPk(req.params.id);
+    if (!taxReturn) return res.status(404).json({ error: 'Tax return not found' });
+
+    const pdfPath = taxReturn.pdfPath;
+    if (!fs.existsSync(pdfPath)) {
+      return res.status(404).json({ error: 'PDF file not found on server' });
+    }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename=${path.basename(pdfPath)}`);
+    fs.createReadStream(pdfPath).pipe(res);
+  } catch (err) {
+    console.error("❌ Error sending PDF:", err);
+    res.status(500).json({ error: 'Failed to download PDF' });
+  }
+});
+
+module.exports = router;
 
 module.exports = router;
